@@ -6,7 +6,11 @@ using System.Threading.Tasks;
 
 namespace Kenan.Receipt
 {
-    public class Class1
+    public class ReceiptItem
     {
+        public string Name { get; set; }
+        public decimal Price { get; set; }
+        public int Amount { get; set; }
+
     }
 }
