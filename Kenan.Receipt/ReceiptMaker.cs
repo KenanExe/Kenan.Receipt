@@ -1,7 +1,14 @@
-﻿using MigraDoc.DocumentObjectModel;
+﻿using Barcoder;
+using Barcoder.Code128;
+using Barcoder.Renderers;
+using MigraDoc.DocumentObjectModel;
 using MigraDoc.DocumentObjectModel.Tables;
 using MigraDoc.Rendering;
 using PdfSharp.Fonts;
+using Barcoder;
+using Barcoder.Code128;
+using PdfSharp.Drawing;
+using PdfSharp.Pdf;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -33,7 +40,6 @@ namespace Kenan.Receipt
         public static List<ReceiptItem> Items { get; set; } = new List<ReceiptItem>();
         public static string Notes { get; set; } = "Thank you for your purchase.";
 
-
         private static void EnsureFonts()
         {
             lock (_fontLock)
@@ -52,6 +58,10 @@ namespace Kenan.Receipt
             var pdfRenderer = new PdfDocumentRenderer();
             pdfRenderer.Document = document;
             pdfRenderer.RenderDocument();
+            if (!string.IsNullOrWhiteSpace(InvoiceNumber))
+            {
+                DrawBarcode(pdfRenderer.PdfDocument);
+            }
 
             using (var stream = new MemoryStream())
             {
@@ -61,10 +71,6 @@ namespace Kenan.Receipt
         }
         private static void BuildDocument(Document document)
         {
-            var normal = document.Styles[StyleNames.Normal];
-            normal.Font.Name = "Arial";
-            normal.Font.Size = 9;
-
             var section = document.AddSection();
             var ps = section.PageSetup;
             ps.PageWidth = Unit.FromMillimeter(90);
@@ -75,35 +81,63 @@ namespace Kenan.Receipt
             // Green header with brand name and amount
             var header = section.AddTable();
             header.AddColumn(Unit.FromMillimeter(78));
+
             var hRow = header.AddRow();
             hRow.Shading.Color = Color.FromRgb(15, 118, 110);
             hRow.Format.Alignment = ParagraphAlignment.Center;
             hRow.Format.Font.Color = Colors.White;
             hRow.TopPadding = Unit.FromMillimeter(4);
             hRow.BottomPadding = Unit.FromMillimeter(4);
-            hRow.Cells[0].AddParagraph("Northwind Studio").Format.Font.Bold = true;
-            var amount = hRow.Cells[0].AddParagraph("$29.00");
+            hRow.Cells[0].AddParagraph($"{BrandName}").Format.Font.Bold = true;
+
+            decimal totalAmount = 0;
+            if (Items.Count > 0)
+            {
+                foreach (var item in Items)
+                {
+                    var lineTotal = item.Amount * item.Price;
+                    totalAmount += lineTotal;
+                }
+            }
+
+            var amount = hRow.Cells[0].AddParagraph($"${totalAmount.ToString("F2")}");
             amount.Format.Font.Size = 20;
             amount.Format.Font.Bold = true;
             //add here a status line for paid/unpaid, etc. later
             section.AddParagraph().Format.SpaceAfter = Unit.FromMillimeter(5);
 
             // info table with receipt number, date, and customer name
-            var info = section.AddTable();
-            
-            info.AddColumn(Unit.FromMillimeter(39));
-            info.TopPadding = Unit.FromMillimeter(1.2);
-            AddLine(info, "Receipt #", "RCPT-12345");
+            if (!string.IsNullOrWhiteSpace(InvoiceNumber) ||
+                !string.IsNullOrWhiteSpace(Date) ||
+                !string.IsNullOrWhiteSpace(CustomerName))
+            {
+                var info = section.AddTable();
+                info.AddColumn(Unit.FromMillimeter(39));
+                info.AddColumn(Unit.FromMillimeter(39));
+                info.TopPadding = Unit.FromMillimeter(1.2);
+                info.BottomPadding = Unit.FromMillimeter(1.2);
 
-            info.BottomPadding = Unit.FromMillimeter(1.2);
-            info.AddColumn(Unit.FromMillimeter(39));
-            AddLine(info, "Date", DateTime.Now.ToString("yyyy-MM-dd"));
+                Row lastRow = null;
+                if (!string.IsNullOrWhiteSpace(InvoiceNumber))
+                {
 
-            var last = AddLine(info, "Customer", "customer Name");
-            last.Borders.Bottom.Style = BorderStyle.Dot;
-            last.Borders.Bottom.Width = 0.5;
-            last.BottomPadding = Unit.FromMillimeter(2);
+                    lastRow = AddLine(info, "Receipt ", $"{InvoiceNumber}");
+                    lastRow.Cells[1].Format.Font.Bold = true;
+                }
+                if (!string.IsNullOrWhiteSpace(Date))
+                {
+                    lastRow = AddLine(info, "Date ", $"{Date}");
+                }
+                if (!string.IsNullOrWhiteSpace(CustomerName))
+                {
+                    lastRow = AddLine(info, "Customer ", $"{CustomerName}");
+                }
 
+                // dotted line under the last visible row
+                lastRow.Borders.Bottom.Style = BorderStyle.Dot;
+                lastRow.Borders.Bottom.Width = 0.5;
+                lastRow.BottomPadding = Unit.FromMillimeter(2);
+            }
             // items table with purchased items and their prices
             var items = section.AddTable();
             items.AddColumn(Unit.FromMillimeter(39));
@@ -111,17 +145,18 @@ namespace Kenan.Receipt
             items.TopPadding = Unit.FromMillimeter(2);
             items.BottomPadding = Unit.FromMillimeter(1.5);
 
-            decimal totalAmount = 0;
             foreach (var item in Items)
             {
                 var lineTotal = item.Amount * item.Price;
-                totalAmount += lineTotal;
-                AddLine(items, $"{item.Name} x {item.Amount}", lineTotal.ToString("F2"));
+                AddLine(items, $"{item.Name} x {item.Amount}", "$" + lineTotal.ToString("F2"));
             }
 
             // total line with total amount paid
-            var total = AddLine(items, "Total paid", totalAmount.ToString("F2"), true);
+            var total = AddLine(items, "Total paid", $"${totalAmount.ToString("F2")}", true);
             total.Cells[1].Format.Font.Color = Color.FromRgb(15, 118, 110);
+            total.Borders.Top.Style = BorderStyle.Dot;
+            total.Borders.Top.Width = 0.5;
+            total.TopPadding = Unit.FromMillimeter(2);
 
             var thanks = section.AddParagraph($"{Notes}");
             thanks.Format.Alignment = ParagraphAlignment.Center;
@@ -137,6 +172,45 @@ namespace Kenan.Receipt
             row.Cells[1].AddParagraph(right).Format.Alignment = ParagraphAlignment.Right;
             row.Format.Font.Bold = bold;
             return row;
+        }
+        private static void DrawBarcode(PdfDocument pdf)
+        {
+            IBarcode barcode;
+            try
+            {
+                barcode = Code128Encoder.Encode(InvoiceNumber);
+            }
+            catch (Exception)
+            {
+                return;
+            }
+
+            int modules = barcode.Bounds.X;
+            var page = pdf.Pages[pdf.PageCount - 1];
+
+            using (var gfx = XGraphics.FromPdfPage(page))
+            {
+                double totalWidth = XUnit.FromMillimeter(60).Point;
+                double barHeight = XUnit.FromMillimeter(12).Point;
+                double moduleWidth = totalWidth / modules;
+
+                double left = (page.Width.Point - totalWidth) / 2;
+                double top = page.Height.Point - XUnit.FromMillimeter(10).Point - barHeight;
+
+                int x = 0;
+                while (x < modules)
+                {
+                    if (barcode.At(x, 0))
+                    {
+                        int start = x;
+                        while (x < modules && barcode.At(x, 0)) x++;
+                        gfx.DrawRectangle(XBrushes.Black,
+                            left + start * moduleWidth, top,
+                            (x - start) * moduleWidth, barHeight);
+                    }
+                    else x++;
+                }
+            }
         }
     }
 }
